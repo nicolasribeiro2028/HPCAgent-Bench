@@ -29,7 +29,6 @@ import dace.transformation.auto.auto_optimize as dace_auto_opt
 import numpy as np
 from dace.codegen import common as dace_common
 from dace.codegen.compiled_sdfg import CompiledSDFG
-from dace.codegen.instrumentation.report import DurationEvent
 from dace.frontend.python.parser import DaceProgram
 from dace.transformation.dataflow import MapCollapse
 
@@ -43,19 +42,16 @@ from hpcagent_bench.frameworks import Benchmark, Framework
 from hpcagent_bench.frameworks import utilities as util
 from hpcagent_bench.frameworks.errors import NotSupportedByFramework
 from hpcagent_bench.frameworks.framework import (
-    MS_PER_S,
-    US_PER_MS,
     AnyArray,
     ArgValue,
     ArrayLike,
     BenchData,
+    CallPlan,
     CopyFunc,
     DeviceArrayModule,
     KernelImpl,
     KernelResult,
     OutputValue,
-    Timer,
-    TimingResult,
     is_dense,
     is_numpy_array,
 )
@@ -650,20 +646,57 @@ def stage_device_arguments(sdfg: dace.SDFG, kwargs: dict[str, ArgValue], cupy: D
 class TimedCompiledSDFG:
     """Callable wrapper around a ``CompiledSDFG`` that exposes ``.sdfg`` (release-agnostic)."""
 
-    __slots__ = ("_exec", "name", "sdfg")
+    __slots__ = ("_exec", "bound", "name", "sdfg")
 
     def __init__(self, dc_exec: CompiledSDFG, sdfg: dace.SDFG, name: str) -> None:
         self._exec = dc_exec
         self.sdfg = sdfg
         self.name = name
+        #: The argument vectors :meth:`bind` marshalled for :meth:`call_bound`; ``None`` when unbound.
+        self.bound: tuple[tuple[object, ...], tuple[object, ...]] | None = None
 
     def __call__(self, *args: ArgValue, **kwargs: ArgValue) -> KernelResult:
         return self._exec(*args, **kwargs)
 
+    def bind(self, kwargs: dict[str, ArgValue]) -> None:
+        """Marshal ``kwargs`` for :meth:`call_bound`. The vectors hold raw pointers: valid only while these
+        arrays live, so every new argument set is bound again."""
+        self.bound = self._exec.construct_arguments(**kwargs)
+
+    def call_bound(self) -> KernelResult:
+        """The compiled call on the vectors :meth:`bind` marshalled, without re-marshalling them."""
+        if self.bound is None:
+            raise RuntimeError(f"{self.name}: call_bound() before bind()")
+        callargs, initargs = self.bound
+        self._exec.fast_call(callargs, initargs, do_gpu_check=True)
+        return self._exec.convert_return_values()
+
     def release_retained(self) -> None:
         """Drop the arguments ``CompiledSDFG`` retains until its next call (else freed inside the timed call); safe
         once outputs are read."""
+        self.bound = None
         self._exec._argument_to_pyobject.clear()
+
+
+class BoundCallPlan(CallPlan):
+    """A plan that marshals a compiled SDFG's arguments in :meth:`before_each`, so the timed bracket holds only the
+    native call (``CompiledSDFG.__call__`` marshals on every call: ~0.1 ms for eight arrays)."""
+
+    __slots__ = ()
+
+    def before_each(self) -> None:
+        super().before_each()
+        if isinstance(self.impl, TimedCompiledSDFG):
+            args, kwargs = self.bound()
+            if args:
+                raise ValueError(f"{self.impl.name}: a compiled SDFG takes keyword arguments only")
+            self.impl.bind(kwargs)
+
+    def run(self) -> KernelResult:
+        if not isinstance(self.impl, TimedCompiledSDFG):
+            return super().run()
+        self.result = self.f.post_call(self.impl.call_bound())
+        return self.result
 
 
 # Framework
@@ -1002,38 +1035,11 @@ class DaceFramework(Framework):
         )
         return outputs
 
-    # Timing override
+    # Timing
 
-    def create_timer(self, program: KernelImpl) -> Timer:
-        """Enable SDFG-level Timer instrumentation for TimedCompiledSDFG programs; else default host timing."""
-        timer = Timer(program)
-        if isinstance(program, TimedCompiledSDFG):
-            program.sdfg.instrument = dace.InstrumentationType.Timer
-        return timer
-
-    def stop_timer(self, timer: Timer) -> TimingResult:
-        """Return DaCe's latest instrumentation report as native time; ``None`` if not instrumented/parseable."""
-        self.synchronize_device()
-        python_t = (time.perf_counter() - timer.t0) * MS_PER_S
-        native_t: float | None = None
-        program = timer.program
-        if isinstance(program, TimedCompiledSDFG):
-            try:
-                report = program.sdfg.get_latest_report()
-                # A counter event carries no duration and is skipped; only DurationEvent is a time.
-                events = report.events if report is not None else []
-                durations_us = [float(ev.duration) for ev in events if isinstance(ev, DurationEvent)]
-                if durations_us:
-                    native_t = durations_us[-1] / US_PER_MS
-            except Exception:  # noqa: BLE001 -- a missing native timing falls back to the Python one
-                native_t = None
-        return TimingResult(python=python_t, native=native_t)
-
-    def free_timer(self, timer: Timer) -> None:
-        """Disable instrumentation so it does not persist across frameworks."""
-        program = timer.program
-        if isinstance(program, TimedCompiledSDFG):
-            program.sdfg.instrument = dace.InstrumentationType.No_Instrumentation
+    def build_call(self, bench: Benchmark, impl: KernelImpl, bdata: BenchData) -> CallPlan:
+        """A compiled SDFG's plan marshals its arguments before the timer starts (:class:`BoundCallPlan`)."""
+        return BoundCallPlan(self, bench, impl, bdata)
 
     # Argument plumbing
 
